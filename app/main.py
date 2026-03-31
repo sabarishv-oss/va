@@ -42,6 +42,8 @@ from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.websockets import WebSocketState
 from loguru import logger
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import InputAudioRawFrame
 from pipecat.pipeline.runner import PipelineRunner
 
@@ -165,6 +167,32 @@ _validate_api_key("INWORLD_API_KEY")
 
 app = FastAPI(title="Samantha — ACS Outbound Pipecat Voice Agent")
 
+
+@app.on_event("startup")
+async def _warmup_silero_vad() -> None:
+    """
+    Instantiate SileroVADAnalyzer once at server startup so the Silero neural-net
+    model file is downloaded and deserialized into memory before the first call
+    arrives.  Every subsequent call reuses the already-loaded model — no cold-load
+    penalty on the live call path (~1–2 s saved on the first call).
+    """
+    try:
+        vad_cfg   = AGENT_SETTINGS["vad"]
+        audio_cfg = AGENT_SETTINGS["audio"]
+        _warmup_vad = SileroVADAnalyzer(
+            sample_rate=audio_cfg["sample_rate"],
+            params=VADParams(
+                confidence=vad_cfg["confidence"],
+                start_secs=vad_cfg["start_secs"],
+                stop_secs=vad_cfg["stop_secs"],
+                min_volume=vad_cfg["min_volume"],
+            ),
+        )
+        logger.info("[STARTUP] Silero VAD model warmed up — cold-load cost paid once.")
+    except Exception as exc:
+        logger.warning(f"[STARTUP] Silero VAD warm-up failed (non-fatal): {exc}")
+
+
 acs_client = CallAutomationClient.from_connection_string(ACS_CONNECTION_STRING)
 
 # session_id → call_connection_id
@@ -183,6 +211,8 @@ _twilio_pending_contexts: deque = deque(maxlen=100)
 _ws_context_by_session_id: dict[str, dict] = {}
 # Last seen Twilio CallSid per callee number (digits only) from /twilio-status.
 _twilio_recent_call_sid_by_callee: dict[str, str] = {}
+# Preferred mapping for safe concurrent hangups: session_id → Twilio CallSid
+_twilio_call_sid_by_session_id: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +237,14 @@ def _build_media_streaming_options(websocket_url: str) -> MediaStreamingOptions:
 
 def _twilio_is_configured() -> bool:
     return bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_FROM_NUMBER)
+
+
+def _twilio_complete_active_calls_for_callee(phone_number: str) -> None:
+    """
+    Deprecated for concurrent calling (unsafe). Intentionally a no-op.
+    Keep the symbol to avoid breaking older code paths, but do not sweep.
+    """
+    return
 
 
 def _require_twilio_config(*, studio_only: bool = False) -> None:
@@ -417,6 +455,12 @@ async def twilio_status_callback(request: Request):
     call_sid = (payload.get("CallSid") or "").strip()
     if to_number and call_sid:
         _twilio_recent_call_sid_by_callee[_digits_only(to_number)] = call_sid
+
+    # Safe concurrent mapping: if caller included session_id in the status callback URL,
+    # store session_id → CallSid so we only ever complete the correct Twilio call.
+    sid_from_qs = (request.query_params.get("session_id") or "").strip()
+    if sid_from_qs and call_sid:
+        _twilio_call_sid_by_session_id[sid_from_qs] = call_sid
     phase_map = {
         "queued": "twilio_status_queued",
         "initiated": "twilio_status_initiated",
@@ -941,7 +985,9 @@ async def ws_endpoint(websocket: WebSocket):
     session_id    = params.get("session_id", str(uuid.uuid4()))
 
     if session_id in _ws_context_by_session_id:
-        stored = _ws_context_by_session_id.pop(session_id)
+        # Do NOT pop here. ACS can reconnect the media WebSocket for the same
+        # session_id; popping would make subsequent connects lose org/phone/services.
+        stored = _ws_context_by_session_id.get(session_id) or {}
         org_name      = stored.get("org_name", "")
         phone_number  = stored.get("target_phone", "")
         services_list = stored.get("services", "")
@@ -984,35 +1030,83 @@ async def ws_endpoint(websocket: WebSocket):
         try:
             acs_client.get_call_connection(conn_id).hang_up(is_for_everyone=True)
             logger.info(f"Hung up | session={session_id[:8]} | conn_id={conn_id}")
+            log_call_timeline(
+                "acs_hangup_requested",
+                session_id=session_id,
+                call_connection_id=conn_id,
+                unique_id=unique_id,
+            )
             # Best-effort Twilio hangup: if we recently saw a Twilio CallSid
             # for this callee, tell Twilio to end that leg as well.
             if _twilio_is_configured() and phone_number:
-                callee_digits = _digits_only(phone_number)
-                twilio_sid = _twilio_recent_call_sid_by_callee.get(callee_digits)
+                # Prefer exact session mapping (safe for concurrency), then fall back
+                # to per-callee last-seen CallSid (unsafe if multiple calls share To).
+                twilio_sid = _twilio_call_sid_by_session_id.get(session_id)
+                if not twilio_sid:
+                    callee_digits = _digits_only(phone_number)
+                    twilio_sid = _twilio_recent_call_sid_by_callee.get(callee_digits)
                 if twilio_sid:
-                    try:
+                    log_call_timeline(
+                        "twilio_hangup_attempt",
+                        session_id=session_id,
+                        unique_id=unique_id,
+                        call_sid=twilio_sid,
+                        callee=phone_number,
+                    )
+
+                    def _twilio_complete_call():
                         twilio_url = (
                             f"https://api.twilio.com/2010-04-01/Accounts/"
                             f"{TWILIO_ACCOUNT_SID}/Calls/{twilio_sid}.json"
                         )
-                        resp = requests.post(
+                        return requests.post(
                             twilio_url,
                             data={"Status": "completed"},
                             auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
                             timeout=10,
                         )
+
+                    try:
+                        resp = await asyncio.to_thread(_twilio_complete_call)
                         if resp.status_code >= 400:
+                            log_call_timeline(
+                                "twilio_hangup_failed",
+                                session_id=session_id,
+                                unique_id=unique_id,
+                                call_sid=twilio_sid,
+                                status_code=resp.status_code,
+                            )
                             logger.warning(
                                 f"[Twilio hangup] Failed for CallSid={twilio_sid} | "
                                 f"status={resp.status_code} | body={resp.text[:200]}"
                             )
                         else:
+                            log_call_timeline(
+                                "twilio_hangup_ok",
+                                session_id=session_id,
+                                unique_id=unique_id,
+                                call_sid=twilio_sid,
+                            )
                             logger.info(
                                 f"[Twilio hangup] Completed CallSid={twilio_sid} "
                                 f"for callee={phone_number}"
                             )
                     except Exception as e:
+                        log_call_timeline(
+                            "twilio_hangup_error",
+                            session_id=session_id,
+                            unique_id=unique_id,
+                            call_sid=twilio_sid,
+                        )
                         logger.warning(f"[Twilio hangup] Error for {twilio_sid}: {e}")
+                else:
+                    log_call_timeline(
+                        "twilio_hangup_skipped_no_callsid",
+                        session_id=session_id,
+                        unique_id=unique_id,
+                        callee=phone_number,
+                    )
+                    # No sweeping fallback here: unsafe for concurrent calling.
         except Exception as e:
             logger.error(f"Hangup failed | session={session_id[:8]} | {e}")
 
@@ -1063,7 +1157,11 @@ async def ws_endpoint(websocket: WebSocket):
 
     if AGENT_SETTINGS["call"].get("agent_speaks_first", False):
         try:
-            # No artificial startup delay: queue the opening turn immediately.
+            # Yield one event-loop tick so StartFrame begins propagating through
+            # the pipeline before we queue the LLMRunFrame. This ensures the
+            # pipeline services (Deepgram, OpenAI, Inworld) are initializing in
+            # parallel with the kickoff rather than receiving the frame cold.
+            await asyncio.sleep(0)
             await session.kickoff_agent_speaks_first()
             log_call_timeline(
                 "agent_first_turn_queued",
@@ -1139,5 +1237,7 @@ async def ws_endpoint(websocket: WebSocket):
         session.cancel_timers()
         if not pipeline_task.done():
             pipeline_task.cancel()
+        # Cleanup server-side context after the media session ends.
+        _ws_context_by_session_id.pop(session_id, None)
 
 #saving file 26th march 2026 9.15am

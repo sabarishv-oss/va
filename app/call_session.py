@@ -174,6 +174,13 @@ class CallSession:
         self._tts_total_seconds = 0.0
         self._tts_context_starts: dict[str, float] = {}
 
+        # Hangup-after-goodbye coordination: we wait for TTS to stop, then
+        # delay a bit before hanging up so the last sentence isn't cut off.
+        self._awaiting_final_tts: bool = False
+        self._final_tts_context_id: str | None = None
+        self._final_tts_stopped_event: asyncio.Event = asyncio.Event()
+        self._final_tts_stopped_event.set()
+
     # ------------------------------------------------------------------
     # Called by pipeline factory after task is created
     # ------------------------------------------------------------------
@@ -259,6 +266,9 @@ class CallSession:
     def record_tts_started(self, context_id: str | None):
         if context_id:
             self._tts_context_starts[context_id] = time.monotonic()
+            if self._awaiting_final_tts:
+                self._final_tts_context_id = context_id
+                self._final_tts_stopped_event.clear()
 
     def record_tts_stopped(self, context_id: str | None):
         if not context_id:
@@ -266,6 +276,19 @@ class CallSession:
         started_at = self._tts_context_starts.pop(context_id, None)
         if started_at is not None:
             self._tts_total_seconds += max(0.0, time.monotonic() - started_at)
+        if self._awaiting_final_tts and (
+            self._final_tts_context_id is None or context_id == self._final_tts_context_id
+        ):
+            self._final_tts_stopped_event.set()
+
+    async def _hangup_after_final_tts(self, *, extra_seconds: float = 2.0, timeout_seconds: float = 20.0):
+        """Wait for final TTS to stop, then wait extra_seconds, then hang up."""
+        try:
+            await asyncio.wait_for(self._final_tts_stopped_event.wait(), timeout=timeout_seconds)
+        except asyncio.TimeoutError:
+            pass
+        await asyncio.sleep(max(0.0, float(extra_seconds)))
+        await self._hangup_fn(0)
 
     # ------------------------------------------------------------------
     # Session start — kick off timers
@@ -392,6 +415,49 @@ class CallSession:
             return
 
         logger.info(f"[CALLER]: {text}")
+
+        # Fast-path: if the first real human response is a clear "no / wrong number",
+        # end the call immediately instead of relying on the LLM to call the tool.
+        # This prevents calls that linger until the callee hangs up.
+        if not self._human_confirmed:
+            t = (text or "").strip().lower()
+            hard_no = {
+                "no", "nope", "nah", "wrong number", "not you", "not this number",
+                "you have the wrong number", "this is the wrong number",
+                "not united states adoption centre", "not that organization",
+            }
+            if t in hard_no or ("wrong number" in t) or ("have the wrong number" in t):
+                logger.info(
+                    f"[SESSION {self.session_id[:8]}] Early negative response — ending call"
+                )
+                # Save a minimal structured result and hang up quickly.
+                result = {
+                    "unique_id":            self.unique_id,
+                    "session_id":           self.session_id,
+                    "timestamp":            datetime.now(timezone.utc).isoformat(),
+                    "phone_status":         "invalid",
+                    "is_correct_number":    "no",
+                    "org_valid":            "incorrect_org",
+                    "call_outcome":         "not_org_wrong_number",
+                    "call_summary": (
+                        f"Receiver indicated this is not {self.org_name or 'the organization'} "
+                        f"or it is the wrong number. Ended call."
+                    ),
+                    "other_numbers":        None,
+                    "services_confirmed":   "unknown",
+                    "available_services":   [],
+                    "unavailable_services": [],
+                    "other_services":       [],
+                    "mentioned_funding":    "no",
+                    "mentioned_callback":   "no",
+                    "dialed_number":        self.phone_number,
+                    "dialed_services":      self.services_list,
+                }
+                self._save_result(result)
+                self._call_ended = True
+                self.cancel_timers()
+                asyncio.create_task(self._hangup_fn(0))
+                return
 
         if not self._human_confirmed:
             vm_match = _contains_keyword(text, VOICEMAIL_KEYWORDS)
@@ -607,9 +673,12 @@ class CallSession:
         # Cancel fallback timer now that we have a clean result
         self.cancel_timers()
 
-        # Schedule hangup after Samantha finishes her goodbye (V1: 10s)
-        cfg = AGENT_SETTINGS["call"]
-        asyncio.create_task(self._hangup_fn(cfg["hangup_delay_seconds"]))
+        # Hang up AFTER the final goodbye audio finishes, plus a small cushion.
+        # This prevents the call from cutting off the last sentence.
+        self._awaiting_final_tts = True
+        self._final_tts_context_id = None
+        self._final_tts_stopped_event.clear()
+        asyncio.create_task(self._hangup_after_final_tts(extra_seconds=2.0))
 
         # Return "captured" so GPT-4o knows to say goodbye
         return {"status": "captured"}

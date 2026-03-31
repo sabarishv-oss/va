@@ -161,6 +161,7 @@ def _place_call_via_twilio_studio(
     org_name: str,
     services: str,
     unique_id: str,
+    session_id: str,
 ) -> str:
     """Start outbound call via Twilio Studio Flow Execution API."""
     _register_context_with_server(phone_number, org_name, services, unique_id)
@@ -169,6 +170,7 @@ def _place_call_via_twilio_studio(
         "org_name": org_name,
         "services": services,
         "unique_id": unique_id,
+        "session_id": session_id,
     }
     payload = {
         "To": phone_number,
@@ -318,7 +320,7 @@ def place_calls() -> None:
             else:
                 if TWILIO_STUDIO_FLOW_SID:
                     exec_sid = _place_call_via_twilio_studio(
-                        phone_number, org_name, services, unique_id,
+                        phone_number, org_name, services, unique_id, session_id,
                     )
                     logger.info(
                         f"Call placed | provider=twilio_studio | "
